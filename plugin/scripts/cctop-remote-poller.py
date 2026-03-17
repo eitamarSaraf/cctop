@@ -11,8 +11,11 @@ Reads machine list from ~/.cctop/machines.json:
     {"alias": "aws-ec2", "user": "ubuntu"}
   ]
 
-For each machine, SSHes every POLL_INTERVAL seconds and copies all *.json files
-from ~/.cctop/ into ~/.cctop/remote/<alias>/. The dashboard picks them up from there.
+On startup, SSHes into each machine and ensures cctop-poller.py is running there
+(bootstraps it if not). Then polls every POLL_INTERVAL seconds, copying all *.json
+files from ~/.cctop/ into ~/.cctop/remote/<alias>/. The dashboard picks them up.
+
+On shutdown, stops the remote pollers it started.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ POLL_INTERVAL = 5.0  # seconds between SSH fetches per machine
 SSH_TIMEOUT = 8      # seconds for each SSH call
 
 _shutdown = False
+_remote_poller_pids: dict[str, int] = {}  # alias -> PID on remote machine
 
 
 def _handle_signal(signum, frame):
@@ -138,6 +142,65 @@ def write_remote_sessions(alias: str, files: dict[str, dict]) -> None:
                 pass
 
 
+def bootstrap_remote_poller(alias: str) -> int | None:
+    """
+    Ensure cctop-poller.py is running on <alias>.
+    Returns the remote PID if started/already running, None on failure.
+
+    Strategy:
+    1. Check if a poller process is already running (pgrep)
+    2. If not, start it via nohup in the background
+    3. Return the PID so we can stop it on shutdown
+    """
+    script = r"""
+export PATH="$HOME/.local/bin:$PATH"
+POLLER="$HOME/code/cctop/plugin/scripts/cctop-poller.py"
+[ -f "$POLLER" ] || exit 1
+
+# Check if already running
+existing=$(pgrep -f "cctop-poller.py" 2>/dev/null | head -1)
+if [ -n "$existing" ]; then
+    echo "RUNNING:$existing"
+    exit 0
+fi
+
+# Start it
+mkdir -p "$HOME/.cctop"
+nohup uv run --script "$POLLER" >> "$HOME/.cctop/poller.log" 2>&1 &
+echo "STARTED:$!"
+"""
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", f"ConnectTimeout={SSH_TIMEOUT}", alias, script],
+            capture_output=True, text=True, timeout=SSH_TIMEOUT + 2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    for line in result.stdout.splitlines():
+        if line.startswith("RUNNING:") or line.startswith("STARTED:"):
+            try:
+                return int(line.split(":", 1)[1].strip())
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
+def stop_remote_poller(alias: str, pid: int) -> None:
+    """Kill the remote poller process we started on <alias>."""
+    script = f"kill {pid} 2>/dev/null || true"
+    try:
+        subprocess.run(
+            ["ssh", "-o", f"ConnectTimeout={SSH_TIMEOUT}", alias, script],
+            capture_output=True, timeout=SSH_TIMEOUT + 2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def poll_machine(alias: str) -> bool:
     """Fetch and store sessions for one machine. Returns True on success."""
     files = fetch_remote_sessions(alias)
@@ -152,34 +215,61 @@ def main() -> None:
 
     # Per-machine next-poll timestamps
     next_poll: dict[str, float] = {}
+    # Track which machines we bootstrapped (so we can stop them on exit)
+    bootstrapped: set[str] = set()
 
-    while not _shutdown:
+    try:
+        # Bootstrap pass: start remote pollers on all configured machines
         machines = load_machines()
-
         for machine in machines:
             alias = machine.get("alias", "")
             if not alias:
                 continue
-            now = time.monotonic()
-            if now >= next_poll.get(alias, 0):
-                poll_machine(alias)
-                next_poll[alias] = time.monotonic() + POLL_INTERVAL
+            pid = bootstrap_remote_poller(alias)
+            if pid:
+                _remote_poller_pids[alias] = pid
+                bootstrapped.add(alias)
 
-        # Remove stale remote dirs for machines no longer in config
-        configured = {m.get("alias") for m in machines if m.get("alias")}
-        if REMOTE_DIR.is_dir():
-            for d in REMOTE_DIR.iterdir():
-                if d.is_dir() and d.name not in configured:
-                    for f in d.glob("*.json"):
-                        try:
-                            f.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+        while not _shutdown:
+            machines = load_machines()
 
-        # Sleep in small increments to stay responsive to shutdown
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline and not _shutdown:
-            time.sleep(0.1)
+            for machine in machines:
+                alias = machine.get("alias", "")
+                if not alias:
+                    continue
+
+                # Bootstrap any newly added machine
+                if alias not in bootstrapped:
+                    pid = bootstrap_remote_poller(alias)
+                    if pid:
+                        _remote_poller_pids[alias] = pid
+                        bootstrapped.add(alias)
+
+                now = time.monotonic()
+                if now >= next_poll.get(alias, 0):
+                    poll_machine(alias)
+                    next_poll[alias] = time.monotonic() + POLL_INTERVAL
+
+            # Remove stale remote dirs for machines no longer in config
+            configured = {m.get("alias") for m in machines if m.get("alias")}
+            if REMOTE_DIR.is_dir():
+                for d in REMOTE_DIR.iterdir():
+                    if d.is_dir() and d.name not in configured:
+                        for f in d.glob("*.json"):
+                            try:
+                                f.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+
+            # Sleep in small increments to stay responsive to shutdown
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and not _shutdown:
+                time.sleep(0.1)
+
+    finally:
+        # Stop remote pollers we started
+        for alias, pid in _remote_poller_pids.items():
+            stop_remote_poller(alias, pid)
 
 
 if __name__ == "__main__":
