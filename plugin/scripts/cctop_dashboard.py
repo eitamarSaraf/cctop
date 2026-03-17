@@ -222,6 +222,7 @@ class SessionInfo:
     subagent_output_tokens: int = 0
     subagent_cache_read_tokens: int = 0
     subagent_cache_creation_tokens: int = 0
+    machine: str = ""  # empty = local, else SSH alias of remote machine
 
     @property
     def context_tokens(self) -> int:
@@ -251,14 +252,10 @@ def styled_status(raw: str, last_activity: str) -> Text:
     return Text(raw or "?", style="dim")
 
 
-def load_sessions() -> list[SessionInfo]:
-    """Read hook JSON + poller JSON per session and merge them."""
+def _load_sessions_from_dir(directory: Path, machine: str = "") -> list[SessionInfo]:
+    """Read hook JSON + poller JSON from a directory and return SessionInfo list."""
     sessions: list[SessionInfo] = []
-    if not STATUS_DIR.is_dir():
-        return sessions
-
-    # First pass: collect all sessions
-    for fp in STATUS_DIR.glob("*.json"):
+    for fp in directory.glob("*.json"):
         if fp.name.endswith(".poller.json"):
             continue
         try:
@@ -266,12 +263,14 @@ def load_sessions() -> list[SessionInfo]:
         except (OSError, json.JSONDecodeError):
             continue
         sid = hook.get("session_id", fp.stem)
-        poller_fp = STATUS_DIR / f"{sid}.poller.json"
+        poller_fp = directory / f"{sid}.poller.json"
         try:
             poller = json.loads(poller_fp.read_text())
         except (OSError, json.JSONDecodeError):
             poller = {}
         raw_pid = hook.get("pid")
+        # For remote sessions, use machine tag from the file if set
+        effective_machine = hook.get("_machine", machine)
         info = SessionInfo(
             session_id=sid,
             cwd=hook.get("cwd", ""),
@@ -303,8 +302,26 @@ def load_sessions() -> list[SessionInfo]:
             subagent_output_tokens=poller.get("subagent_output_tokens", 0),
             subagent_cache_read_tokens=poller.get("subagent_cache_read_tokens", 0),
             subagent_cache_creation_tokens=poller.get("subagent_cache_creation_tokens", 0),
+            machine=effective_machine,
         )
         sessions.append(info)
+    return sessions
+
+
+def load_sessions() -> list[SessionInfo]:
+    """Read local and remote session files and merge into one list."""
+    if not STATUS_DIR.is_dir():
+        return []
+
+    # Local sessions
+    sessions = _load_sessions_from_dir(STATUS_DIR, machine="")
+
+    # Remote sessions (one subdir per machine alias)
+    remote_dir = STATUS_DIR / "remote"
+    if remote_dir.is_dir():
+        for machine_dir in remote_dir.iterdir():
+            if machine_dir.is_dir():
+                sessions.extend(_load_sessions_from_dir(machine_dir, machine=machine_dir.name))
 
     return sessions
 
@@ -560,7 +577,7 @@ class SessionsDashboard(App):
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.cursor_type = "row"
-        table.add_columns("Slug", "Project", "Branch", "Status", "Model", "Ctx%", "Tokens", "Tools", "Files", "Agents", "Errors", "Turns", "StopRsn", "Duration", "Started", "Activity")
+        table.add_columns("Machine", "Slug", "Project", "Branch", "Status", "Model", "Ctx%", "Tokens", "Tools", "Files", "Agents", "Errors", "Turns", "StopRsn", "Duration", "Started", "Activity")
         self.refresh_data()
         self.set_interval(0.5, self.refresh_data)
 
@@ -651,7 +668,9 @@ class SessionsDashboard(App):
             ctx_pct = f"{ctx * 100 // CONTEXT_WINDOW}%" if ctx else ""
             tokens = format_tokens(ctx)
             errors_cell = Text(str(s.error_count), style="red") if s.error_count else ""
+            machine_cell = Text(s.machine, style="bold cyan") if s.machine else Text("local", style="dim")
             table.add_row(
+                machine_cell,
                 Text.assemble(("● ", "#e0af68"), s.custom_title) if s.custom_title else Text.assemble(("○ ", "dim"), s.session_id[:8]),
                 project,
                 s.git_branch[:20],
