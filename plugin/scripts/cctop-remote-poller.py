@@ -157,8 +157,8 @@ export PATH="$HOME/.local/bin:$PATH"
 POLLER="$HOME/code/cctop/plugin/scripts/cctop-poller.py"
 [ -f "$POLLER" ] || exit 1
 
-# Check if already running
-existing=$(pgrep -f "cctop-poller.py" 2>/dev/null | head -1)
+# Check if already running (exclude pgrep itself and ssh commands)
+existing=$(ps aux | grep "[c]ctop-poller.py" | grep -v "ssh\|pgrep" | awk '{print $2}' | head -1)
 if [ -n "$existing" ]; then
     echo "RUNNING:$existing"
     exit 0
