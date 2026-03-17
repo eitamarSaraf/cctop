@@ -336,9 +336,10 @@ def purge_dead_sessions() -> int:
     if not STATUS_DIR.is_dir():
         return 0
 
+    _SKIP = {"machines.json", "config.json"}
     removed = 0
     for fp in STATUS_DIR.glob("*.json"):
-        if fp.name.endswith(".poller.json"):
+        if fp.name.endswith(".poller.json") or fp.name in _SKIP:
             continue
         try:
             hook = json.loads(fp.read_text())
