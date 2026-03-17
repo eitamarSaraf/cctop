@@ -255,8 +255,9 @@ def styled_status(raw: str, last_activity: str) -> Text:
 def _load_sessions_from_dir(directory: Path, machine: str = "") -> list[SessionInfo]:
     """Read hook JSON + poller JSON from a directory and return SessionInfo list."""
     sessions: list[SessionInfo] = []
+    _SKIP = {"machines.json", "config.json"}
     for fp in directory.glob("*.json"):
-        if fp.name.endswith(".poller.json"):
+        if fp.name.endswith(".poller.json") or fp.name in _SKIP:
             continue
         try:
             hook = json.loads(fp.read_text())

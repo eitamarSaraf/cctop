@@ -230,8 +230,9 @@ def cleanup_dead_sessions() -> int:
     removed = 0
     now = time.time()
 
+    _SKIP = {"machines.json", "config.json"}
     for hook_fp in STATUS_DIR.glob("*.json"):
-        if hook_fp.name.endswith(".poller.json"):
+        if hook_fp.name.endswith(".poller.json") or hook_fp.name in _SKIP:
             continue
 
         try:
@@ -501,9 +502,10 @@ def poll_once() -> None:
     if not STATUS_DIR.is_dir():
         return
 
+    _SKIP = {"machines.json", "config.json"}
     for hook_fp in STATUS_DIR.glob("*.json"):
-        # Skip poller files (*.poller.json)
-        if hook_fp.stem.endswith(".poller"):
+        # Skip poller files (*.poller.json) and known config files
+        if hook_fp.stem.endswith(".poller") or hook_fp.name in _SKIP:
             continue
 
         hook_data = read_json(hook_fp)
